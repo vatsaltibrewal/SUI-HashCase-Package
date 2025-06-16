@@ -90,7 +90,7 @@ module hashcase::hashcase_module {
         description: String,
         creator: address,
         owner: address,
-        nfts: Table<ID, NFT>,
+        //nfts: Table<ID, NFT>,
         mint_type: u8,
         base_mint_price: u64,
         collected_funds: Balance<SUI>,
@@ -226,7 +226,7 @@ module hashcase::hashcase_module {
             description,
             creator: sender,
             owner: sender,
-            nfts: table::new(ctx),
+            //nfts: table::new(ctx),
             mint_type,
             base_mint_price: if (mint_type == MINT_TYPE_FREE) { 0 } else { base_mint_price },
             collected_funds: balance::zero(),
@@ -312,8 +312,8 @@ module hashcase::hashcase_module {
         let nft_id = object::new(ctx);
         let nft_id_inner = object::uid_to_inner(&nft_id);
 
-        // Create NFT - store in a local variable first
-        let new_nft = NFT {
+        // Create NFT instance to return
+        let nft = NFT {
             id: nft_id,
             name,
             description,
@@ -326,9 +326,6 @@ module hashcase::hashcase_module {
             metadata_version: 1
         };
 
-        // Update collection
-        table::add(&mut collection.nfts, nft_id_inner, new_nft);
-        
         // Add to price table if dynamic pricing
         if (collection.mint_type == MINT_TYPE_DYNAMIC_PRICE) {
             table::add(&mut collection.nft_prices, nft_id_inner, mint_price);
@@ -345,19 +342,8 @@ module hashcase::hashcase_module {
             mint_price
         });
 
-        // Create and return a new NFT instance
-        NFT {
-            id: object::new(ctx),
-            name,
-            description,
-            image_url: url::new_unsafe_from_bytes(image_url_bytes),
-            collection_id: object::uid_to_inner(&collection.id),
-            creator: tx_context::sender(ctx),
-            attributes,
-            token_number,
-            mint_price,
-            metadata_version: 1
-        }
+        // Return the NFT without storing it in collection table
+        nft
     }
 
     // ======== Minting Functions ========
@@ -416,21 +402,10 @@ module hashcase::hashcase_module {
             coin::value(payment) >= price, 
             EInsufficientPayment
         );
-        
-        let payment_amount = coin::value(payment);
 
         // Transfer payment to collection balance
         let paid_coins = coin::split(payment, price, ctx);
-        balance::join(
-            &mut collection.collected_funds, 
-            coin::into_balance(paid_coins)
-        );
-         // Refund remaining amount to the user
-        let remaining_amount = payment_amount - price;
-        if (remaining_amount > 0) {
-            let remaining_coin = coin::split(payment, remaining_amount, ctx);
-            transfer::public_transfer(remaining_coin, tx_context::sender(ctx));
-        };
+        coin::put(&mut collection.collected_funds, paid_coins);
 
         // Mint NFT
         let nft = internal_mint_nft(
@@ -472,10 +447,7 @@ module hashcase::hashcase_module {
         
         // Transfer payment to collection balance
         let paid_coins = coin::split(payment, mint_price, ctx);
-        balance::join(
-            &mut collection.collected_funds, 
-            coin::into_balance(paid_coins)
-        );
+        coin::put(&mut collection.collected_funds, paid_coins);
 
         // Mint NFT
         let nft = internal_mint_nft(
@@ -549,22 +521,22 @@ module hashcase::hashcase_module {
         let nft_id = object::uid_to_inner(&nft.id);
         
         // Remove from collection's table if it exists there
-        if (table::contains(&collection.nfts, nft_id)) {
-            let removed_nft = table::remove(&mut collection.nfts, nft_id);
-            let NFT { 
-                id, 
-                name: _, 
-                description: _, 
-                image_url: _, 
-                collection_id: _, 
-                creator: _, 
-                attributes: _, 
-                token_number: _,
-                mint_price: _,
-                metadata_version: _
-            } = removed_nft;
-            object::delete(id);
-        };
+        // if (table::contains(&collection.nfts, nft_id)) {
+        //     let removed_nft = table::remove(&mut collection.nfts, nft_id);
+        //     let NFT { 
+        //         id, 
+        //         name: _, 
+        //         description: _, 
+        //         image_url: _, 
+        //         collection_id: _, 
+        //         creator: _, 
+        //         attributes: _, 
+        //         token_number: _,
+        //         mint_price: _,
+        //         metadata_version: _
+        //     } = removed_nft;
+        //     object::delete(id);
+        // };
 
         // Destruct the original NFT
         let NFT { 
@@ -597,7 +569,7 @@ module hashcase::hashcase_module {
 
     // ======== Utility Functions ========
     public fun get_collection_nft_count(collection: &Collection): u64 {
-        table::length(&collection.nfts)
+        collection.current_supply
     }
 
     public fun get_collection_total_funds(collection: &Collection): u64 {
