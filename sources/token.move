@@ -1,82 +1,71 @@
-module hashcase::loyalty_points {
-    use sui::token::{Self, Token, ActionRequest};
-    use sui::tx_context::{Self, TxContext};
-    use sui::transfer;
-    use sui::object::{Self, UID};
+module hashcase::loyalty {
     use sui::coin::{Self, TreasuryCap};
-    use std::option;
+    use sui::token::{Self, Token, ActionRequest, TokenPolicy, TokenPolicyCap};
+    use sui::tx_context::{TxContext, sender};
+    use sui::transfer;
+    use std::option::{Self, Option};
 
-    /// Custom errors
-    const EInvalidAmount: u64 = 0;
-    const EUnauthorized: u64 = 1;
-    const EInsufficientBalance: u64 = 2;
+    /// Token amount mismatch error.
+    const E_INCORRECT_AMOUNT: u64 = 0;
 
-    /// The OTW for the Token
-    public struct LOYALTY_POINTS has drop {}
+    /// One-time witness for the LOYALTY type.
+    public struct LOYALTY has drop {}
 
-    /// Rule requirement for token operations
-    public struct TokenRule has drop {}
+    /// Marker type representing the Store for spending policies.
+    public struct Store has drop {}
 
-    /// Initialize the loyalty points system
-    fun init(otw: LOYALTY_POINTS, ctx: &mut TxContext) {
-        // Create the currency
-        let (treasury_cap, metadata) = coin::create_currency(
-            otw,
-            0, // no decimals
-            b"HLP",
-            b"Hashcase Loyalty Points",
-            b"Hashcase Loyalty Points",
-            option::none(),
-            ctx
-        );
+    /// Initialization: creates the LOYALTY token and policy, and gives
+    /// the deploying admin the TreasuryCap and TokenPolicyCap.
+    fun init(otw: LOYALTY, ctx: &mut TxContext) {
+        // Create the token with symbol "LOY", name, and no decimals.
+        let (treasury_cap, coin_metadata) =
+            coin::create_currency(
+                otw,
+                0,                     // decimals
+                b"HLP",                // symbol
+                b"Hashcase Loyalty Points",      // name
+                b"Hashcase Loyalty Points", // description
+                option::none(),        // url
+                ctx,
+            );
 
-        transfer::public_freeze_object(metadata);
-        transfer::public_share_object(treasury_cap);
+        // Create a policy and get its cap.
+        let (mut policy, policy_cap) = token::new_policy(&treasury_cap, ctx);
+
+        token::allow(&mut policy, &policy_cap, token::spend_action(), ctx);
+
+        // Allow transfers to be confirmed by treasury cap (for admin rewards)
+        token::allow(&mut policy, &policy_cap, token::transfer_action(), ctx);
+
+        // Share token policy and freeze metadata for public viewing.
+        token::share_policy(policy);
+        transfer::public_freeze_object(coin_metadata);
+
+        // Give both caps to the deployer/admin.
+        transfer::public_transfer(policy_cap, sender(ctx));
+        transfer::public_transfer(treasury_cap, sender(ctx));
     }
 
-
-    // At Start
-    public fun create_user_points(
-        treasury_cap: &mut TreasuryCap<LOYALTY_POINTS>,
+    /// Admin-only minting: reward a user with amount points.
+    public fun reward_user(
+        cap: &mut TreasuryCap<LOYALTY>,
         amount: u64,
         recipient: address,
-        ctx: &mut TxContext
+        ctx: &mut TxContext,
     ) {
-        let token = token::mint(treasury_cap, amount, ctx);
+        let token = token::mint(cap, amount, ctx);
         let req = token::transfer(token, recipient, ctx);
-        token::confirm_with_treasury_cap(treasury_cap, req, ctx);
-    }
-
-    // Subsequent Addition 
-    public fun add_points(
-        treasury_cap: &mut TreasuryCap<LOYALTY_POINTS>,
-        user_token: &mut Token<LOYALTY_POINTS>,
-        amount: u64,
-        ctx: &mut TxContext
-    ) {
-        let new_points = token::mint(treasury_cap, amount, ctx);
-        token::join(user_token, new_points);
+        // Confirm transfer with the treasury cap.
+        token::confirm_with_treasury_cap(cap, req, ctx);
     }
 
     public fun spend_points(
-        treasury_cap: &mut TreasuryCap<LOYALTY_POINTS>,
-        token: &mut Token<LOYALTY_POINTS>,
-        amount: u64,
-        ctx: &mut TxContext
+        policy: &mut TokenPolicy<LOYALTY>,
+        token: Token<LOYALTY>,
+        ctx: &mut TxContext,
     ) {
-        // Check sufficient balance
-        assert!(token::value(token) >= amount, EInsufficientBalance);
-        
-        // Split the amount to spend
-        let points_to_burn = token::split(token, amount, ctx);
-        
-        // Burn the split points
-        let mut req = token::spend(points_to_burn, ctx);
-        token::confirm_with_treasury_cap(treasury_cap, req, ctx);
+        let req = token::spend(token, ctx);
+        token::confirm_request_mut(policy, req, ctx);
     }
 
-    /// Get current balance
-    public fun get_balance(token: &Token<LOYALTY_POINTS>): u64 {
-        token::value(token)
-    }
 }
