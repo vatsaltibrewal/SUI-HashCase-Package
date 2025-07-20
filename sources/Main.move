@@ -32,11 +32,17 @@ module hashcase::hashcase_module {
     const ECollectionFull: u64 = 9;
     const EInvalidMetadata: u64 = 10;
     const EInvalidMintType: u64 = 11;
+    const EInvalidTicket: u64 = 12;
+    const ETicketUsed: u64 = 13;
+    const ETicketMismatch: u64 = 14;
 
     // Mint Type Enum
     const MINT_TYPE_FREE: u8 = 0;
     const MINT_TYPE_FIXED_PRICE: u8 = 1;
     const MINT_TYPE_DYNAMIC_PRICE: u8 = 2;
+
+    // ======== One-Time-Witness ========
+    public struct HASHCASE_MODULE has drop {}
 
     // ======== Events ========
     public struct CollectionCreated has copy, drop {
@@ -73,6 +79,19 @@ module hashcase::hashcase_module {
         new_metadata_version: u64
     }
 
+    public struct UpdateTicketCreated has copy, drop {
+        ticket_id: ID,
+        nft_id: ID,
+        recipient: address,
+        admin: address
+    }
+
+    public struct UpdateTicketUsed has copy, drop {
+        ticket_id: ID,
+        nft_id: ID,
+        user: address
+    }
+
     // ======== Capabilities ========
     public struct AdminCap has key, store { 
         id: UID 
@@ -83,6 +102,21 @@ module hashcase::hashcase_module {
         creator: address 
     }
 
+    // ======== Update Ticket System ========
+    public struct UpdateTicket has key, store {
+        id: UID,
+        nft_id: ID,
+        collection_id: ID,
+        recipient: address,
+        new_name: String,
+        new_description: String,
+        new_image_url: vector<u8>,
+        new_attributes: vector<String>,
+        created_by: address,
+        created_at: u64,
+        is_used: bool
+    }
+
     // ======== Core Structs ========
     public struct Collection has key {
         id: UID,
@@ -90,7 +124,6 @@ module hashcase::hashcase_module {
         description: String,
         creator: address,
         owner: address,
-        //nfts: Table<ID, NFT>,
         mint_type: u8,
         base_mint_price: u64,
         collected_funds: Balance<SUI>,
@@ -131,12 +164,78 @@ module hashcase::hashcase_module {
     }
 
     // ======== Initialization ========
-    fun init(ctx: &mut TxContext) {
+    fun init(otw: HASHCASE_MODULE, ctx: &mut TxContext) {
         // Create and transfer AdminCap to deployer
         let admin = AdminCap { 
             id: object::new(ctx) 
         };
         transfer::transfer(admin, tx_context::sender(ctx));
+
+        // Claim the Publisher for the package
+        let publisher = package::claim(otw, ctx);
+
+        // Set up Display for NFT
+        let nft_keys = vector[
+            b"name".to_string(),
+            b"description".to_string(), 
+            b"image_url".to_string(),
+            b"creator".to_string(),
+            b"collection_id".to_string(),
+            b"token_number".to_string(),
+            b"attributes".to_string(),
+            b"mint_price".to_string(),
+            b"metadata_version".to_string()
+        ];
+
+        let nft_values = vector[
+            b"{name}".to_string(),
+            b"{description}".to_string(),
+            b"{image_url}".to_string(), 
+            b"{creator}".to_string(),
+            b"{collection_id}".to_string(),
+            b"#{token_number}".to_string(),
+            b"{attributes}".to_string(),
+            b"{mint_price} SUI".to_string(),
+            b"v{metadata_version}".to_string()
+        ];
+
+        let mut nft_display = display::new_with_fields<NFT>(
+            &publisher, nft_keys, nft_values, ctx
+        );
+        nft_display.update_version();
+
+        // Set up Display for ClaimedNFT
+        let claimed_nft_keys = vector[
+            b"name".to_string(),
+            b"description".to_string(),
+            b"image_url".to_string(), 
+            b"claimer".to_string(),
+            b"collection_id".to_string(),
+            b"original_nft_id".to_string(),
+            b"claimed_date".to_string(),
+            b"attributes".to_string()
+        ];
+
+        let claimed_nft_values = vector[
+            b"{name} (Claimed)".to_string(),
+            b"{description}".to_string(),
+            b"{image_url}".to_string(),
+            b"{claimer}".to_string(), 
+            b"{collection_id}".to_string(),
+            b"{original_nft_id}".to_string(),
+            b"Claimed at epoch {claimed_date}".to_string(),
+            b"{attributes}".to_string()
+        ];
+
+        let mut claimed_nft_display = display::new_with_fields<ClaimedNFT>(
+            &publisher, claimed_nft_keys, claimed_nft_values, ctx
+        );
+        claimed_nft_display.update_version();
+
+        // Transfer publisher and displays to deployer
+        transfer::public_transfer(publisher, tx_context::sender(ctx));
+        transfer::public_transfer(nft_display, tx_context::sender(ctx));
+        transfer::public_transfer(claimed_nft_display, tx_context::sender(ctx));
     }
 
     // ======== Admin Functions ========
@@ -152,54 +251,9 @@ module hashcase::hashcase_module {
         transfer::transfer(owner_cap, for_address);
     }
 
-    public entry fun admin_mint_nft(
-        _admin: &AdminCap,
-        collection: &mut Collection,
-        name: String,
-        description: String,
-        image_url_bytes: vector<u8>,
-        attributes: vector<String>,
-        recipient: address,
-        ctx: &mut TxContext
-    ) {
-        // Admin can mint in any collection
-        let nft = internal_mint_nft(
-            collection, 
-            name, 
-            description, 
-            image_url_bytes, 
-            attributes, 
-            0, // mint price for admin mint
-            recipient, 
-            ctx
-        );
-        
-        // Transfer the NFT to recipient
-        transfer::public_transfer(nft, recipient);
-    }
-
-    // ======== Admin Functions for Flexibility ========
-    public entry fun admin_set_nft_price(
-        _admin: &AdminCap,
-        collection: &mut Collection,
-        nft_id: ID,
-        new_price: u64
-    ) {
-        // Only works for dynamic pricing collections
-        assert!(
-            collection.mint_type == MINT_TYPE_DYNAMIC_PRICE, 
-            EInvalidMintType
-        );
-
-        // Update price in the table
-        if (table::contains(&collection.nft_prices, nft_id)) {
-            *table::borrow_mut(&mut collection.nft_prices, nft_id) = new_price;
-        };
-    }
-
-    // ======== Owner Functions ========
+    // Admin-only Collection Creation
     public entry fun create_collection(
-        owner_cap: &OwnerCap,
+        _admin: &AdminCap,
         name: String,
         description: String,
         mint_type: u8,
@@ -212,21 +266,14 @@ module hashcase::hashcase_module {
         base_attributes: vector<String>,
         ctx: &mut TxContext
     ) {
-        // Verify owner
-        assert!(
-            owner_cap.creator == tx_context::sender(ctx), 
-            ENotOwner
-        );
-
         let sender = tx_context::sender(ctx);
 
         let collection = Collection {
             id: object::new(ctx),
-            name,  // Removed .clone()
+            name,
             description,
             creator: sender,
             owner: sender,
-            //nfts: table::new(ctx),
             mint_type,
             base_mint_price: if (mint_type == MINT_TYPE_FREE) { 0 } else { base_mint_price },
             collected_funds: balance::zero(),
@@ -251,14 +298,51 @@ module hashcase::hashcase_module {
         transfer::share_object(collection);
     }
 
-    // Function to update NFT metadata directly
-    public entry fun update_nft_metadata(
-        collection: &Collection,  // Only need immutable reference to verify collection
+    // ======== Update Ticket System Functions ========
+    
+    // Single Update Ticket Creation - Optimized for PTB usage
+    public entry fun create_update_ticket(
+        _admin: &AdminCap,
+        nft_id: ID,
+        collection_id: ID,
+        recipient: address,
+        new_name: String,
+        new_description: String,
+        new_image_url_bytes: vector<u8>,
+        new_attributes: vector<String>,
+        ctx: &mut TxContext
+    ) {
+        let admin_address = tx_context::sender(ctx);
+        
+        let ticket = UpdateTicket {
+            id: object::new(ctx),
+            nft_id,
+            collection_id,
+            recipient,
+            new_name,
+            new_description,
+            new_image_url: new_image_url_bytes,
+            new_attributes,
+            created_by: admin_address,
+            created_at: tx_context::epoch(ctx),
+            is_used: false
+        };
+
+        event::emit(UpdateTicketCreated {
+            ticket_id: object::uid_to_inner(&ticket.id),
+            nft_id,
+            recipient,
+            admin: admin_address
+        });
+
+        transfer::public_transfer(ticket, recipient);
+    }
+
+    // Permission-based NFT Metadata Update using Ticket
+    public entry fun update_nft_metadata_with_ticket(
+        collection: &Collection,
         nft: &mut NFT,
-        name: String,
-        description: String,
-        image_url_bytes: vector<u8>,
-        attributes: vector<String>,
+        ticket: UpdateTicket,
         ctx: &mut TxContext
     ) {
         // Verify the NFT belongs to the collection
@@ -267,11 +351,23 @@ module hashcase::hashcase_module {
         // Verify collection is dynamic
         assert!(collection.is_dynamic, ECollectionNotDynamic);
 
-        // Update NFT metadata fields
-        nft.name = name;
-        nft.description = description;
-        nft.image_url = url::new_unsafe_from_bytes(image_url_bytes);
-        nft.attributes = attributes;
+        // Verify ticket is for this specific NFT
+        assert!(ticket.nft_id == object::uid_to_inner(&nft.id), ETicketMismatch);
+        
+        // Verify ticket collection matches
+        assert!(ticket.collection_id == object::uid_to_inner(&collection.id), ETicketMismatch);
+        
+        // Verify ticket recipient matches sender
+        assert!(ticket.recipient == tx_context::sender(ctx), ENotAuthorized);
+        
+        // Verify ticket hasn't been used
+        assert!(!ticket.is_used, ETicketUsed);
+
+        // Update NFT metadata with ticket data
+        nft.name = ticket.new_name;
+        nft.description = ticket.new_description;
+        nft.image_url = url::new_unsafe_from_bytes(ticket.new_image_url);
+        nft.attributes = ticket.new_attributes;
         
         // Increment metadata version
         nft.metadata_version = nft.metadata_version + 1;
@@ -283,6 +379,170 @@ module hashcase::hashcase_module {
             updater: tx_context::sender(ctx),
             new_metadata_version: nft.metadata_version
         });
+
+        // Emit ticket used event
+        event::emit(UpdateTicketUsed {
+            ticket_id: object::uid_to_inner(&ticket.id),
+            nft_id: object::uid_to_inner(&nft.id),
+            user: tx_context::sender(ctx)
+        });
+
+        // Consume the ticket (delete it)
+        let UpdateTicket {
+            id,
+            nft_id: _,
+            collection_id: _,
+            recipient: _,
+            new_name: _,
+            new_description: _,
+            new_image_url: _,
+            new_attributes: _,
+            created_by: _,
+            created_at: _,
+            is_used: _
+        } = ticket;
+        
+        object::delete(id);
+    }
+
+    // Admin-only Free Mint
+    public entry fun admin_free_mint_nft(
+        _admin: &AdminCap,
+        collection: &mut Collection,
+        name: String,
+        description: String,
+        image_url_bytes: vector<u8>,
+        attributes: vector<String>,
+        recipient: address,
+        ctx: &mut TxContext
+    ) {
+        // Verify free minting is allowed
+        assert!(
+            collection.mint_type == MINT_TYPE_FREE, 
+            EInvalidMintType
+        );
+
+        let nft = internal_mint_nft(
+            collection, 
+            name, 
+            description, 
+            image_url_bytes, 
+            attributes,
+            0,  // Free mint price
+            recipient,
+            ctx
+        );
+
+        transfer::public_transfer(nft, recipient);
+    }
+
+    // Admin-only Fixed Price Mint
+    public entry fun admin_fixed_price_mint_nft(
+        _admin: &AdminCap,
+        collection: &mut Collection,
+        payment: &mut Coin<SUI>,
+        name: String,
+        description: String,
+        image_url_bytes: vector<u8>,
+        attributes: vector<String>,
+        recipient: address,
+        ctx: &mut TxContext
+    ) {
+        // Verify fixed price minting
+        assert!(
+            collection.mint_type == MINT_TYPE_FIXED_PRICE, 
+            EInvalidMintType
+        );
+
+        // Store base_mint_price in local variable to avoid multiple borrows
+        let price = collection.base_mint_price;
+        
+        // Verify payment
+        assert!(
+            coin::value(payment) == price, 
+            EInsufficientPayment
+        );
+
+        // Transfer payment to collection balance
+        let paid_coins = coin::split(payment, price, ctx);
+        coin::put(&mut collection.collected_funds, paid_coins);
+
+        // Mint NFT
+        let nft = internal_mint_nft(
+            collection, 
+            name, 
+            description, 
+            image_url_bytes, 
+            attributes, 
+            price,
+            recipient,
+            ctx
+        );
+
+        transfer::public_transfer(nft, recipient);
+    }
+
+    // Admin-only Dynamic Price Mint
+    public entry fun admin_dynamic_price_mint_nft(
+        _admin: &AdminCap,
+        collection: &mut Collection,
+        payment: &mut Coin<SUI>,
+        name: String,
+        description: String,
+        image_url_bytes: vector<u8>,
+        attributes: vector<String>,
+        mint_price: u64,
+        recipient: address,
+        ctx: &mut TxContext
+    ) {
+        // Verify dynamic pricing
+        assert!(
+            collection.mint_type == MINT_TYPE_DYNAMIC_PRICE, 
+            EInvalidMintType
+        );
+
+        // Verify payment
+        assert!(
+            coin::value(payment) >= mint_price, 
+            EInsufficientPayment
+        );
+        
+        // Transfer payment to collection balance
+        let paid_coins = coin::split(payment, mint_price, ctx);
+        coin::put(&mut collection.collected_funds, paid_coins);
+
+        // Mint NFT
+        let nft = internal_mint_nft(
+            collection, 
+            name, 
+            description, 
+            image_url_bytes, 
+            attributes, 
+            mint_price,
+            recipient,
+            ctx
+        );
+
+        transfer::public_transfer(nft, recipient);
+    }
+
+    // ======== Admin Functions for Flexibility ========
+    public entry fun admin_set_nft_price(
+        _admin: &AdminCap,
+        collection: &mut Collection,
+        nft_id: ID,
+        new_price: u64
+    ) {
+        // Only works for dynamic pricing collections
+        assert!(
+            collection.mint_type == MINT_TYPE_DYNAMIC_PRICE, 
+            EInvalidMintType
+        );
+
+        // Update price in the table
+        if (table::contains(&collection.nft_prices, nft_id)) {
+            *table::borrow_mut(&mut collection.nft_prices, nft_id) = new_price;
+        };
     }
 
     // ======== Internal Mint Function ========
@@ -346,125 +606,6 @@ module hashcase::hashcase_module {
         nft
     }
 
-    // ======== Minting Functions ========
-    // Free Mint
-    public entry fun free_mint_nft(
-        collection: &mut Collection,
-        name: String,
-        description: String,
-        image_url_bytes: vector<u8>,
-        attributes: vector<String>,
-        ctx: &mut TxContext
-    ) {
-        // Verify free minting is allowed
-        assert!(
-            collection.mint_type == MINT_TYPE_FREE, 
-            EInvalidMintType
-        );
-
-        let recipient = tx_context::sender(ctx);
-
-        let nft = internal_mint_nft(
-            collection, 
-            name, 
-            description, 
-            image_url_bytes, 
-            attributes,
-            0,  // Free mint price
-            recipient,
-            ctx
-        );
-
-        transfer::public_transfer(nft, recipient);
-    }
-
-    // Fixed Price Mint
-    public entry fun fixed_price_mint_nft(
-        collection: &mut Collection,
-        payment: &mut Coin<SUI>,
-        name: String,
-        description: String,
-        image_url_bytes: vector<u8>,
-        attributes: vector<String>,
-        ctx: &mut TxContext
-    ) {
-        // Verify fixed price minting
-        assert!(
-            collection.mint_type == MINT_TYPE_FIXED_PRICE, 
-            EInvalidMintType
-        );
-
-        // Store base_mint_price in local variable to avoid multiple borrows
-        let price = collection.base_mint_price;
-        
-        // Verify payment
-        assert!(
-            coin::value(payment) >= price, 
-            EInsufficientPayment
-        );
-
-        // Transfer payment to collection balance
-        let paid_coins = coin::split(payment, price, ctx);
-        coin::put(&mut collection.collected_funds, paid_coins);
-
-        // Mint NFT
-        let nft = internal_mint_nft(
-            collection, 
-            name, 
-            description, 
-            image_url_bytes, 
-            attributes, 
-            price,
-            tx_context::sender(ctx),
-            ctx
-        );
-
-        transfer::public_transfer(nft, tx_context::sender(ctx));
-    }
-
-    // Dynamic Price Mint
-    public entry fun dynamic_price_mint_nft(
-        collection: &mut Collection,
-        payment: &mut Coin<SUI>,
-        name: String,
-        description: String,
-        image_url_bytes: vector<u8>,
-        attributes: vector<String>,
-        mint_price: u64,
-        ctx: &mut TxContext
-    ) {
-        // Verify dynamic pricing
-        assert!(
-            collection.mint_type == MINT_TYPE_DYNAMIC_PRICE, 
-            EInvalidMintType
-        );
-
-        // Verify payment
-        assert!(
-            coin::value(payment) >= mint_price, 
-            EInsufficientPayment
-        );
-        
-        // Transfer payment to collection balance
-        let paid_coins = coin::split(payment, mint_price, ctx);
-        coin::put(&mut collection.collected_funds, paid_coins);
-
-        // Mint NFT
-        let nft = internal_mint_nft(
-            collection, 
-            name, 
-            description, 
-            image_url_bytes, 
-            attributes, 
-            mint_price,
-            tx_context::sender(ctx),
-            ctx
-        );
-
-        transfer::public_transfer(nft, tx_context::sender(ctx));
-    }
-
-    
     public entry fun withdraw_collection_funds(
         _owner_cap: &OwnerCap,  // Added underscore to fix unused parameter warning
         collection: &mut Collection,
@@ -492,14 +633,11 @@ module hashcase::hashcase_module {
     // Claim NFT Function
     public entry fun claim_nft(
         collection: &mut Collection,
-        nft: NFT,  // Take ownership of the NFT directly
+        nft: NFT,
         ctx: &mut TxContext
     ) {
         // Verify collection is claimable
         assert!(collection.is_claimable, ENotAuthorized);
-        
-        // No need to verify ownership - if the user can pass the NFT object, they own it
-        // due to Sui Move's ownership model
         
         // Verify NFT belongs to the collection
         assert!(nft.collection_id == object::uid_to_inner(&collection.id), ENotAuthorized);
@@ -519,24 +657,6 @@ module hashcase::hashcase_module {
 
         // Get NFT ID before destructuring
         let nft_id = object::uid_to_inner(&nft.id);
-        
-        // Remove from collection's table if it exists there
-        // if (table::contains(&collection.nfts, nft_id)) {
-        //     let removed_nft = table::remove(&mut collection.nfts, nft_id);
-        //     let NFT { 
-        //         id, 
-        //         name: _, 
-        //         description: _, 
-        //         image_url: _, 
-        //         collection_id: _, 
-        //         creator: _, 
-        //         attributes: _, 
-        //         token_number: _,
-        //         mint_price: _,
-        //         metadata_version: _
-        //     } = removed_nft;
-        //     object::delete(id);
-        // };
 
         // Destruct the original NFT
         let NFT { 
@@ -552,9 +672,6 @@ module hashcase::hashcase_module {
             metadata_version: _
         } = nft;
         object::delete(id);
-
-        // Update collection supply
-        //collection.current_supply = collection.current_supply - 1;
 
         // Emit claim event
         event::emit(NFTClaimed {
@@ -574,5 +691,18 @@ module hashcase::hashcase_module {
 
     public fun get_collection_total_funds(collection: &Collection): u64 {
         balance::value(&collection.collected_funds)
+    }
+
+    // ======== Ticket Utility Functions ========
+    public fun is_ticket_valid(ticket: &UpdateTicket): bool {
+        !ticket.is_used
+    }
+
+    public fun get_ticket_nft_id(ticket: &UpdateTicket): ID {
+        ticket.nft_id
+    }
+
+    public fun get_ticket_recipient(ticket: &UpdateTicket): address {
+        ticket.recipient
     }
 }
